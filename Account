@@ -1,0 +1,277 @@
+using StayEase.Helpers;
+using StayEase.Models;
+using StayEase.Models.ViewModels;
+using System;
+using System.IO;
+using System.Linq;
+using System.Web;
+using System.Web.Mvc;
+
+namespace StayEase.Controllers
+{
+    public class AccountController : Controller
+    {
+        private readonly ApplicationDbContext db = new ApplicationDbContext();
+
+        // GET: /Account/Register
+        [HttpGet]
+        public ActionResult Register()
+        {
+            return View();
+        }
+
+        // POST: /Account/Register
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public ActionResult Register(RegisterViewModel vm)
+        {
+            if (!ModelState.IsValid)
+                return View(vm);
+
+            if (db.Users.Any(u => u.Email == vm.Email))
+            {
+                ModelState.AddModelError("", "Email already exists.");
+                return View(vm);
+            }
+
+            string imagePath = null;
+
+            // IMAGE HANDLING
+            if (vm.ImageFile != null && vm.ImageFile.ContentLength > 0)
+            {
+                var allowed = new[] { ".jpg", ".jpeg", ".png", ".gif" };
+                var ext = Path.GetExtension(vm.ImageFile.FileName)?.ToLower();
+
+                if (string.IsNullOrEmpty(ext) || !allowed.Contains(ext))
+                {
+                    ModelState.AddModelError("", "Invalid image format.");
+                    return View(vm);
+                }
+
+                var fileName = Guid.NewGuid() + ext;
+                var folder = Server.MapPath("~/Uploads");
+
+                if (!Directory.Exists(folder))
+                    Directory.CreateDirectory(folder);
+
+                vm.ImageFile.SaveAs(Path.Combine(folder, fileName));
+
+                imagePath = "/Uploads/" + fileName;
+            }
+
+            var user = new User
+            {
+                FullName = vm.FullName,
+                Email = vm.Email,
+                Gender = vm.Gender,
+                Phone = vm.Phone,
+                Address = vm.Address,
+                IdProof = vm.IdProof,
+                Occupation = vm.Occupation,
+                PasswordHash = PasswordHelper.HashPassword(vm.Password),
+                Role = vm.Role,
+                ImagePath = imagePath,
+                CreatedAt = DateTime.Now
+            };
+
+            db.Users.Add(user);
+            db.SaveChanges();
+
+            // SESSION LOGIN
+            Session["UserId"] = user.Id;
+            Session["UserName"] = user.FullName;
+            Session["UserRole"] = user.Role;
+
+            if (user.Role.Equals("Admin", StringComparison.OrdinalIgnoreCase))
+                return RedirectToAction("Dashboard", "Admin");
+
+            return RedirectToAction("Index", "Home");
+        }
+
+        // GET: /Account/Login
+        [HttpGet]
+        public ActionResult Login()
+        {
+            return View();
+        }
+
+        // POST: /Account/Login
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public ActionResult Login(LoginViewModel vm)
+        {
+            if (!ModelState.IsValid)
+                return View(vm);
+
+            try
+            {
+                var user = db.Users.FirstOrDefault(u =>
+                    u.Email == vm.NameOrEmail || u.FullName == vm.NameOrEmail);
+
+                if (user == null || !PasswordHelper.VerifyPassword(vm.Password, user.PasswordHash))
+                {
+                    ModelState.AddModelError("", "Invalid Email/Name or Password");
+                    return View(vm);
+                }
+
+                if (!string.IsNullOrEmpty(vm.Role) && user.Role != vm.Role)
+                {
+                    ModelState.AddModelError("", "You do not have permission to login as this role");
+                    return View(vm);
+                }
+
+                // session
+                Session["UserId"] = user.Id;
+                Session["UserName"] = user.FullName;
+                Session["UserRole"] = user.Role;
+
+                if (user.Role == "Admin")
+                    return RedirectToAction("Dashboard", "Admin");
+
+                return RedirectToAction("Index", "Home");
+            }
+            catch
+            {
+                ModelState.AddModelError("", "Database error. Try again later.");
+                return View(vm);
+            }
+        }
+
+        // GET: /Account/ForgotPassword
+        [HttpGet]
+        public ActionResult ForgotPassword()
+        {
+            return View();
+        }
+
+        // POST Forgot Password
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public ActionResult ForgotPassword(ForgotPasswordViewModel vm)
+        {
+            if (!ModelState.IsValid)
+                return View(vm);
+
+            var user = db.Users.FirstOrDefault(u => u.Email == vm.Email);
+
+            if (user == null)
+            {
+                ModelState.AddModelError("", "Email not found.");
+                return View(vm);
+            }
+
+            var otp = new Random().Next(100000, 999999).ToString();
+
+            user.OtpCode = otp;
+            user.OtpExpiry = DateTime.Now.AddMinutes(15);
+            db.SaveChanges();
+
+            try
+            {
+                EmailHelper.SendEmail(
+                    user.Email,
+                    "Stay Ease - Password Reset OTP",
+                    $"Hello {user.FullName},<br/><br/>Your OTP is <b>{otp}</b><br/>Valid for 15 minutes."
+                );
+            }
+            catch (Exception ex)
+            {
+                ModelState.AddModelError("", "Unable to send email: " + ex.Message);
+                return View(vm);
+            }
+
+            TempData["EmailForReset"] = user.Email;
+
+            return RedirectToAction("VerifyOTP");
+        }
+
+        // GET: /Account/VerifyOTP
+        [HttpGet]
+        public ActionResult VerifyOTP()
+        {
+            ViewBag.Email = TempData["EmailForReset"] ?? "";
+            return View();
+        }
+
+        // POST Verify OTP
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public ActionResult VerifyOTP(string email, string otp)
+        {
+            if (string.IsNullOrEmpty(email) || string.IsNullOrEmpty(otp))
+            {
+                ModelState.AddModelError("", "Email and OTP required.");
+                ViewBag.Email = email;
+                return View();
+            }
+
+            var user = db.Users.FirstOrDefault(u => u.Email == email);
+
+            if (user == null || user.OtpCode != otp || user.OtpExpiry < DateTime.Now)
+            {
+                ModelState.AddModelError("", "Invalid or expired OTP.");
+                ViewBag.Email = email;
+                return View();
+            }
+
+            TempData["EmailForReset"] = email;
+
+            return RedirectToAction("ResetPassword");
+        }
+
+        // GET: Reset Password
+        [HttpGet]
+        public ActionResult ResetPassword()
+        {
+            ViewBag.Email = TempData["EmailForReset"] ?? "";
+            return View();
+        }
+
+        // POST Reset Password
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public ActionResult ResetPassword(ResetPasswordViewModel vm)
+        {
+            if (!ModelState.IsValid)
+                return View(vm);
+
+            var user = db.Users.FirstOrDefault(u => u.Email == vm.Email);
+
+            if (user == null)
+            {
+                ModelState.AddModelError("", "Email not found.");
+                return View(vm);
+            }
+
+            if (user.OtpCode != vm.Otp || user.OtpExpiry < DateTime.Now)
+            {
+                ModelState.AddModelError("", "Invalid or expired OTP.");
+                return View(vm);
+            }
+
+            user.PasswordHash = PasswordHelper.HashPassword(vm.NewPassword);
+            user.OtpCode = null;
+            user.OtpExpiry = null;
+            db.SaveChanges();
+
+            TempData["ResetSuccess"] = "Password updated successfully!";
+            return RedirectToAction("Login");
+        }
+
+        // LOGOUT
+        public ActionResult Logout()
+        {
+            Session.Clear();
+            return RedirectToAction("Index", "Home");
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                db.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+    }
+}
